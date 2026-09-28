@@ -64,7 +64,7 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             V="${{ github.event.inputs.version }}"
           else
-            V="$(node -pe "require('./desktop/package.json').version")"
+            V="$(node -pe "require('./package.json').version")"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Building version $V for ${{ matrix.target }}"
@@ -83,16 +83,15 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
-          cache-dependency-path: desktop/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: desktop/src-tauri
+          workspaces: src-tauri
 
       - name: Install JS deps
-        working-directory: desktop
         run: pnpm install --frozen-lockfile
 
       - name: Build, sign & upload to the public release
@@ -104,7 +103,7 @@ jobs:
           # Publishes the Release to THIS public repo.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: desktop
+          projectPath: .
           tagName: v${{ steps.v.outputs.version }}
           releaseName: 'Workkk v${{ steps.v.outputs.version }}'
           releaseBody: 'See the assets below to download and install Workkk.'
@@ -143,7 +142,7 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             V="${{ github.event.inputs.version }}"
           else
-            V="$(node -pe "require('./src/desktop/package.json').version")"
+            V="$(node -pe "require('./src/package.json').version")"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
@@ -151,7 +150,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # reads THIS public repo's release assets
         run: |
-          node src/desktop/scripts/gen-release-manifest.mjs \
+          node src/scripts/gen-release-manifest.mjs \
             --version "${{ steps.v.outputs.version }}" \
             --official official
 
