@@ -1,0 +1,169 @@
+name: Build & publish (Windows + Linux)
+
+# Builds the Workkk desktop agent for Windows + Linux from the PRIVATE source repo
+# (applitz/workkk-desktop) and publishes the installers + auto-update artifacts to
+# THIS public repo's Releases. Runs on the public repo so it uses unlimited free
+# GitHub Actions minutes + storage, while the source stays private.
+#
+# macOS is built locally on a Mac with `pnpm release` (avoids a CI arch-naming pitfall
+# for the .app.tar.gz updater artifact) — this workflow only adds Windows + Linux to
+# the same v<version> release.
+#
+# Required secrets (Settings -> Secrets and variables -> Actions on THIS repo):
+#   SRC_TOKEN                            PAT that can read applitz/workkk-desktop and
+#                                        write applitz/workkk-official (classic PAT with
+#                                        `repo` scope, or a fine-grained PAT on those two
+#                                        repos with Contents: Read/Write).
+#   TAURI_SIGNING_PRIVATE_KEY            Contents of ~/.workkk/updater.key (the minisign
+#                                        private key whose pubkey is in tauri.conf.json).
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   Its password (set to an empty value if none).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private source ref to build (branch / tag / sha)'
+        required: false
+        default: 'main'
+      version:
+        description: 'Version override (default: read desktop/package.json)'
+        required: false
+
+permissions:
+  contents: write # create/update Releases in THIS (public) repo
+
+env:
+  SRC_REPO: applitz/workkk-desktop
+  OFFICIAL_REPO: applitz/workkk-official
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          token: ${{ secrets.SRC_TOKEN }}
+          ref: ${{ github.event.inputs.ref || 'main' }}
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="$(node -pe "require('./desktop/package.json').version")"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version $V for ${{ matrix.target }}"
+
+      - name: Install Linux build deps
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install JS deps
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, sign & upload to the public release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # Updater signing (minisign) — makes the .nsis.zip / .AppImage.tar.gz verifiable.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Publishes the Release to THIS public repo.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: v${{ steps.v.outputs.version }}
+          releaseName: 'Workkk v${{ steps.v.outputs.version }}'
+          releaseBody: 'See the assets below to download and install Workkk.'
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }}
+
+  # Regenerate the site's release manifest so workkk.tech (download page + auto-updater)
+  # picks up the new Windows + Linux artifacts. Commits to applitz/workkk-official.
+  manifest:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout private source (for the manifest script)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          token: ${{ secrets.SRC_TOKEN }}
+          ref: ${{ github.event.inputs.ref || 'main' }}
+          path: src
+
+      - name: Checkout official site
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OFFICIAL_REPO }}
+          token: ${{ secrets.SRC_TOKEN }}
+          path: official
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="$(node -pe "require('./src/desktop/package.json').version")"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate release manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # reads THIS public repo's release assets
+        run: |
+          node src/desktop/scripts/gen-release-manifest.mjs \
+            --version "${{ steps.v.outputs.version }}" \
+            --official official
+
+      - name: Commit manifest to the official site (auto-deploys)
+        working-directory: official
+        run: |
+          git config user.name "workkk-release-bot"
+          git config user.email "release@workkk.tech"
+          git add src/releases/releases.json
+          if git diff --cached --quiet; then
+            echo "No manifest changes."
+          else
+            git commit -m "release(desktop): win+linux for v${{ steps.v.outputs.version }}"
+            git push
+          fi
