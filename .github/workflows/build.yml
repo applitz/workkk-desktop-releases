@@ -48,6 +48,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
+          - platform: macos-14 # Apple Silicon
+            target: aarch64-apple-darwin
+            arch: aarch64
+          - platform: macos-13 # Intel
+            target: x86_64-apple-darwin
+            arch: x64
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout private source
@@ -78,7 +84,8 @@ jobs:
             libgtk-3-dev libglib2.0-dev libdbus-1-dev libclang-dev \
             libxss-dev libxdo-dev libxtst-dev libxi-dev libx11-dev libxrandr-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libpipewire-0.3-dev libspa-0.2-dev
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev libwayland-dev
 
       - uses: pnpm/action-setup@v4
         with:
@@ -98,14 +105,17 @@ jobs:
       - name: Install JS deps
         run: pnpm install --frozen-lockfile
 
-      - name: Build, sign & upload to the public release
+      # ── Windows / Linux ──────────────────────────────────────────────────────
+      # tauri-action builds, signs the updater artifacts, and uploads straight to the
+      # release. No macOS arch-collision here, so the built-in uploader is fine.
+      - name: Build, sign & upload (Windows / Linux)
+        if: runner.os != 'macOS'
         uses: tauri-apps/tauri-action@v0
         env:
-          # Updater signing (minisign) — makes the .nsis.zip / .AppImage.tar.gz verifiable.
+          WORKKK_DEFAULT_API: https://api.workkk.tech # compile-time API base (config.rs)
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Publishes the Release to THIS public repo.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # publishes to THIS public repo
         with:
           projectPath: .
           tagName: v${{ steps.v.outputs.version }}
@@ -114,6 +124,57 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      # ── macOS ────────────────────────────────────────────────────────────────
+      # Both mac archs emit an updater artifact named "Workkk.app.tar.gz", which would
+      # collide in one release, so we build here (Developer ID sign + notarize) WITHOUT
+      # letting tauri-action upload, then rename arch-tagged and upload ourselves.
+      - name: Prepare notary API key (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+
+      - name: Build, sign & notarize (macOS)
+        if: runner.os == 'macOS'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          WORKKK_DEFAULT_API: https://api.workkk.tech
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          # APPLE_API_KEY_PATH is exported to $GITHUB_ENV in the step above.
+        with:
+          projectPath: .
+          args: --target ${{ matrix.target }} # no tagName → build only, don't upload
+
+      - name: Upload macOS artifacts (arch-tagged) to the release
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bundle="src-tauri/target/${{ matrix.target }}/release/bundle"
+          arch="${{ matrix.arch }}"
+          tag="v${{ steps.v.outputs.version }}"
+          stage="$(mktemp -d)"
+          cp "$bundle"/dmg/*.dmg "$stage"/                                  # Workkk_<ver>_<arch>.dmg
+          cp "$bundle"/macos/*.app.tar.gz "$stage/Workkk_${arch}.app.tar.gz"
+          cp "$bundle"/macos/*.app.tar.gz.sig "$stage/Workkk_${arch}.app.tar.gz.sig"
+          echo "Uploading:"; ls -la "$stage"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" "$stage"/* --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$tag" "$stage"/* --repo "${{ github.repository }}" \
+              --title "Workkk $tag" \
+              --notes "See the assets below to download and install Workkk."
+          fi
 
   # Regenerate the site's release manifest so workkk.tech (download page + auto-updater)
   # picks up the new Windows + Linux artifacts. Commits to applitz/workkk-official.
