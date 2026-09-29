@@ -1,13 +1,16 @@
-name: Build & publish (Windows + Linux)
+name: Build & publish (all platforms, incremental)
 
-# Builds the Workkk desktop agent for Windows + Linux from the PRIVATE source repo
-# (applitz/workkk-desktop) and publishes the installers + auto-update artifacts to
-# THIS public repo's Releases. Runs on the public repo so it uses unlimited free
-# GitHub Actions minutes + storage, while the source stays private.
+# Builds the Workkk desktop agent for macOS (arm64 + Intel), Windows and Linux from the
+# PRIVATE source repo (applitz/workkk-desktop) and publishes installers + auto-update
+# artifacts to THIS public repo's Releases. Runs on the public repo so it uses unlimited
+# free GitHub Actions minutes + storage, while the source stays private.
 #
-# macOS is built locally on a Mac with `pnpm release` (avoids a CI arch-naming pitfall
-# for the .app.tar.gz updater artifact) — this workflow only adds Windows + Linux to
-# the same v<version> release.
+# INCREMENTAL RELEASE: each platform regenerates + pushes the site manifest as soon as
+# its OWN build+upload finishes — so a platform goes live on workkk.tech the moment it's
+# ready, without waiting for the slowest job (e.g. the frequently-backed-up macos-13
+# Intel runner). The manifest regen reads the LIVE release assets and always resets onto
+# the latest official/main before pushing, so concurrent jobs converge (assets only grow;
+# a platform absent from the release is blanked, never served as a broken update).
 #
 # Required secrets (Settings -> Secrets and variables -> Actions on THIS repo):
 #   SRC_TOKEN                            PAT that can read applitz/workkk-desktop and
@@ -62,6 +65,13 @@ jobs:
           repository: ${{ env.SRC_REPO }}
           token: ${{ secrets.SRC_TOKEN }}
           ref: ${{ github.event.inputs.ref || 'main' }}
+
+      - name: Checkout official site (for the incremental manifest publish)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OFFICIAL_REPO }}
+          token: ${{ secrets.SRC_TOKEN }}
+          path: _site
 
       - name: Resolve version
         id: v
@@ -176,58 +186,34 @@ jobs:
               --notes "See the assets below to download and install Workkk."
           fi
 
-  # Regenerate the site's release manifest so workkk.tech (download page + auto-updater)
-  # picks up the new Windows + Linux artifacts. Commits to applitz/workkk-official.
-  manifest:
-    needs: build
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout private source (for the manifest script)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SRC_REPO }}
-          token: ${{ secrets.SRC_TOKEN }}
-          ref: ${{ github.event.inputs.ref || 'main' }}
-          path: src
-
-      - name: Checkout official site
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.OFFICIAL_REPO }}
-          token: ${{ secrets.SRC_TOKEN }}
-          path: official
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Resolve version
-        id: v
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            V="${{ github.event.inputs.version }}"
-          else
-            V="$(node -pe "require('./src/package.json').version")"
-          fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-
-      - name: Regenerate release manifest
+      # ── Incremental publish ──────────────────────────────────────────────────
+      # As soon as THIS platform's artifacts are in the release, regenerate the site
+      # manifest from the live release and push it — so this platform goes live NOW,
+      # without waiting for the other jobs. Race-safe: hard-reset onto the latest
+      # official/main and retry, and the regen reflects whatever assets exist at that
+      # moment (they only grow; a platform still absent is blanked, never a broken update).
+      - name: Publish this platform to the site
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # reads THIS public repo's release assets
         run: |
-          node src/scripts/gen-release-manifest.mjs \
-            --version "${{ steps.v.outputs.version }}" \
-            --official official
-
-      - name: Commit manifest to the official site (auto-deploys)
-        working-directory: official
-        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"
+          cd _site
           git config user.name "workkk-release-bot"
           git config user.email "release@workkk.tech"
-          git add src/releases/releases.json
-          if git diff --cached --quiet; then
-            echo "No manifest changes."
-          else
-            git commit -m "release(desktop): win+linux for v${{ steps.v.outputs.version }}"
-            git push
-          fi
+          for attempt in 1 2 3 4 5 6; do
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            node ../scripts/gen-release-manifest.mjs --version "$V" --official .
+            git add src/releases/releases.json
+            if git diff --cached --quiet; then
+              echo "No manifest change for ${{ matrix.target }} (already published)."; exit 0
+            fi
+            git commit -q -m "release(desktop): v$V — ${{ matrix.target }} live"
+            if git push -q origin HEAD:main; then
+              echo "Published ${{ matrix.target }} for v$V."; exit 0
+            fi
+            echo "official push race (attempt $attempt) — retrying"; sleep $((attempt * 3))
+          done
+          echo "::error::failed to publish ${{ matrix.target }} manifest after retries"; exit 1
